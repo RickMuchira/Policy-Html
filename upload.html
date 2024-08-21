@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload PDF</title>
+    <style>
+        body {
+            font-family: "Poppins", sans-serif;
+            background: #E3F2FD;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+        .upload-container {
+            text-align: center;
+            padding: 30px;
+            background: #fff;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        .upload-container h2 {
+            margin-bottom: 20px;
+            font-size: 1.5rem;
+        }
+        .upload-container input[type="file"] {
+            margin-bottom: 20px;
+        }
+        .upload-container button {
+            padding: 10px 20px;
+            background: #724ae8;
+            color: #fff;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background 0.3s ease;
+        }
+        .upload-container button:hover {
+            background: #563ac9;
+        }
+    </style>
+</head>
+<body>
+    <div class="upload-container">
+        <h2>Upload a PDF</h2>
+        <form id="pdf-upload-form" enctype="multipart/form-data">
+            <input type="file" id="pdf-file" name="file" accept="application/pdf" required>
+            <br>
+            <button type="submit">Upload PDF</button>
+        </form>
+        <div id="status-message"></div>
+    </div>
+
+    <script>
+        const pdfUploadForm = document.getElementById('pdf-upload-form');
+        const statusMessage = document.getElementById('status-message');
+
+        pdfUploadForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData();
+            formData.append('file', document.getElementById('pdf-file').files[0]);
+
+            try {
+                const response = await fetch("http://127.0.0.1:5000/upload", {
+                    method: "POST",
+                    body: formData
+                });
+
+                if (response.ok) {
+                    statusMessage.innerHTML = '<p style="color: green;">PDF uploaded and processed successfully</p>';
+                } else {
+                    statusMessage.innerHTML = '<p style="color: red;">Error uploading PDF</p>';
+                }
+            } catch (error) {
+                statusMessage.innerHTML = '<p style="color: red;">Error: Unable to contact the server</p>';
+            }
+        });
+    </script>
+</body>
+</html>

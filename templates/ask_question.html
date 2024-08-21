@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+    <meta charset="utf-8">
+    <title>Ask Questions - Skolo Online</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+
+    <button class="chatbot-toggler">
+        <span class="material-symbols-rounded">mode_comment</span>
+        <span class="material-symbols-outlined">close</span>
+    </button>
+
+    <div class="chatbot">
+        <header>
+            <h2>Ask a Question</h2>
+            <span class="close-btn material-symbols-outlined">close</span>
+        </header>
+        <ul class="chatbox">
+            <li class="chat incoming">
+                <span class="material-symbols-outlined">smart_toy</span>
+                <p>Hi! 👋<br>Ask me anything related to the PDFs you've uploaded.</p>
+            </li>
+            {% if answer %}
+            <li class="chat outgoing">
+                <p>{{ answer }}</p>
+            </li>
+            <li class="chat incoming">
+                <p>Study Progress: {{ progress * 100 }}%</p>
+                <progress value="{{ progress }}" max="1"></progress>
+            </li>
+            {% endif %}
+        </ul>
+        <div class="chat-input">
+            <form action="{{ url_for('ask_question') }}" method="POST">
+                <textarea name="question" placeholder="Enter your question here..." spellcheck="false" required></textarea>
+                <span id="send-btn" class="material-symbols-rounded">
+                    <button type="submit">send</button>
+                </span>
+            </form>
+        </div>
+    </div>
+
+</body>
+</html>
