@@ -71,7 +71,7 @@ def embed_pdfs(docs):
             continue
 
     vectors = None
-    batch_size = 100  # Maximum allowed by the API
+    batch_size = 100  # API batch size limit
     for i in range(0, len(final_documents), batch_size):
         batch_documents = final_documents[i:i+batch_size]
         try:
@@ -254,19 +254,30 @@ def ask_question():
         return jsonify({"error": "No question provided."}), 400
 
     try:
+        # Retrieve FAISS index and documents
         index = faiss.read_index("shared_storage/vectors.index")
         with open("shared_storage/documents.pkl", "rb") as f:
             documents = pickle.load(f)
 
+        # Create an in-memory docstore
         docstore = InMemoryDocstore({i: doc for i, doc in enumerate(documents)})
-        vectors = FAISS(embedding_function=GoogleGenerativeAIEmbeddings(model="models/embedding-001"), docstore=docstore, index=index, index_to_docstore_id={i: i for i in range(len(documents))})
+        vectors = FAISS(embedding_function=GoogleGenerativeAIEmbeddings(model="models/embedding-001"), 
+                        docstore=docstore, 
+                        index=index, 
+                        index_to_docstore_id={i: i for i in range(len(documents))})
 
+        # Prepare and retrieve context for the question
         document_chain = create_stuff_documents_chain(llm, prompt)
         retriever = vectors.as_retriever()
         retrieval_chain = create_retrieval_chain(retriever, document_chain)
+
+        # Get the answer
         response = retrieval_chain.invoke({'input': question})
         answer = response['answer']
 
+        # Provide detailed logging for debugging
+        logger.info(f"Question: {question}, Answer: {answer}")
+        
         return jsonify({"answer": answer})
     except Exception as e:
         logger.error(f"Error processing question: {question}. Error: {e}")

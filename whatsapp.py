@@ -1,83 +1,46 @@
-# whatsapp.py
-
 import os
-import pickle
 import logging
 from flask import Flask, request, abort
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from twilio.twiml.messaging_response import MessagingResponse
-import faiss
-from langchain.docstore.document import Document
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain_community.vectorstores import FAISS
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain.chains import create_retrieval_chain
-from langchain_community.docstore.in_memory import InMemoryDocstore
+from twilio.rest import Client
 from dotenv import load_dotenv
 
-# Load environment variables
+# Import functions from app.py
+from app import load_faiss_index, generate_response
+
+# Load environment variables from .env
 load_dotenv()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load the GROQ and Google API keys
-groq_api_key = os.getenv('GROQ_API_KEY')
-os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
+# Load Twilio credentials and number from environment variables
+twilio_account_sid = os.getenv('TWILIO_ACCOUNT_SID')
+twilio_auth_token = os.getenv('TWILIO_AUTH_TOKEN')
+twilio_number = os.getenv('TWILIO_PHONE_NUMBER')  # WhatsApp-enabled Twilio number
 
-# Initialize ChatGroq
-llm = ChatGroq(groq_api_key=groq_api_key, model_name="Llama3-8b-8192")
-
-# Create ChatPromptTemplate
-prompt = ChatPromptTemplate.from_template(
-    """
-    Answer the questions based on the provided context only.
-    Please provide the most accurate response based on the question.
-    <context>
-    {context}
-    <context>
-    Questions:{input}
-    """
-)
+# Initialize Twilio client
+twilio_client = Client(twilio_account_sid, twilio_auth_token)
 
 # Initialize Flask app
 whatsapp_app = Flask(__name__)
 
-# Function to perform vector embedding
-def embed_pdfs(docs):
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    final_documents = []
-
-    for doc in docs:
-        chunks = text_splitter.split_documents([doc])
-        final_documents.extend(chunks)
-
-    vectors = FAISS.from_documents(final_documents, embeddings)
-    return vectors, final_documents
-
-# Function to generate response
-def generate_response(question, vectors):
-    document_chain = create_stuff_documents_chain(llm, prompt)
-    retriever = vectors.as_retriever()
-    retrieval_chain = create_retrieval_chain(retriever, document_chain)
-    response = retrieval_chain.invoke({'input': question})
-    return response['answer']
-
 # Route to handle incoming WhatsApp messages
 @whatsapp_app.route('/whatsapp', methods=['POST'])
 def whatsapp_receive():
+    # Get the message content and sender's phone number from the request
     incoming_msg = request.values.get('Body', '').strip()
+    sender_number = request.values.get('From', '').strip()
+
+    logger.info(f"Received message from {sender_number}: {incoming_msg}")
 
     try:
-        # Send an opening message if the incoming message is the first interaction
-        if incoming_msg.lower() == 'hi' or incoming_msg.lower() == 'hello':
+        # Handle greetings
+        if incoming_msg.lower() in ['hi', 'hello']:
             opening_message = (
                 "Hello! Welcome to our WhatsApp service. "
-                "You can ask me questions about the People and Culture Policy Manual . "
+                "You can ask me questions about the People and Culture Policy Manual. "
                 "Simply type your question and I will provide you with the best possible answer."
             )
             resp = MessagingResponse()
@@ -87,20 +50,11 @@ def whatsapp_receive():
         if not incoming_msg:
             abort(400, "No message content found.")
 
-        index = faiss.read_index("shared_storage/vectors.index")
-        with open("shared_storage/documents.pkl", "rb") as f:
-            documents = pickle.load(f)
+        # Use functions from app.py to load FAISS index and generate a response
+        vectors = load_faiss_index()  # Load FAISS index and documents
+        answer = generate_response(incoming_msg, vectors)  # Generate the response based on the message
 
-        docstore = InMemoryDocstore({i: doc for i, doc in enumerate(documents)})
-        vectors = FAISS(
-            embedding_function=GoogleGenerativeAIEmbeddings(model="models/embedding-001"),
-            docstore=docstore,
-            index=index,
-            index_to_docstore_id={i: i for i in range(len(documents))}
-        )
-
-        answer = generate_response(incoming_msg, vectors)
-
+        # Send the response to the user via WhatsApp
         resp = MessagingResponse()
         resp.message(answer)
         return str(resp)
@@ -109,5 +63,7 @@ def whatsapp_receive():
         logger.error(f"Error processing message: {incoming_msg}. Error: {e}")
         abort(500, "An error occurred while processing your message.")
 
+
 if __name__ == '__main__':
+    # Start the Flask app for WhatsApp on port 5001
     whatsapp_app.run(debug=True, port=5001)
