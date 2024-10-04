@@ -1,27 +1,16 @@
 import os
 import logging
-from flask import Flask, request, abort
+from flask import Flask, request, abort, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client
 from dotenv import load_dotenv
+from app import ask_question  # Import the question-answering function from app.py
 
-# Import functions from app.py
-from app import load_faiss_index, generate_response
-
-# Load environment variables from .env
+# Load environment variables
 load_dotenv()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Load Twilio credentials and number from environment variables
-twilio_account_sid = os.getenv('TWILIO_ACCOUNT_SID')
-twilio_auth_token = os.getenv('TWILIO_AUTH_TOKEN')
-twilio_number = os.getenv('TWILIO_PHONE_NUMBER')  # WhatsApp-enabled Twilio number
-
-# Initialize Twilio client
-twilio_client = Client(twilio_account_sid, twilio_auth_token)
 
 # Initialize Flask app
 whatsapp_app = Flask(__name__)
@@ -29,41 +18,54 @@ whatsapp_app = Flask(__name__)
 # Route to handle incoming WhatsApp messages
 @whatsapp_app.route('/whatsapp', methods=['POST'])
 def whatsapp_receive():
-    # Get the message content and sender's phone number from the request
-    incoming_msg = request.values.get('Body', '').strip()
-    sender_number = request.values.get('From', '').strip()
-
-    logger.info(f"Received message from {sender_number}: {incoming_msg}")
-
     try:
+        # Get the incoming message and sender's phone number
+        incoming_msg = request.values.get('Body', '').strip()
+        sender_number = request.values.get('From', '').strip()
+
+        logger.info(f"Received message from {sender_number}: {incoming_msg}")
+
         # Handle greetings
         if incoming_msg.lower() in ['hi', 'hello']:
             opening_message = (
                 "Hello! Welcome to our WhatsApp service. "
-                "You can ask me questions about the People and Culture Policy Manual. "
+                "You can ask me questions based on the documents we have. "
                 "Simply type your question and I will provide you with the best possible answer."
             )
             resp = MessagingResponse()
             resp.message(opening_message)
             return str(resp)
 
+        # If the message is empty, return an error
         if not incoming_msg:
+            logger.error("Empty message received.")
             abort(400, "No message content found.")
 
-        # Use functions from app.py to load FAISS index and generate a response
-        vectors = load_faiss_index()  # Load FAISS index and documents
-        answer = generate_response(incoming_msg, vectors)  # Generate the response based on the message
+        # Process the question using `ask_question` from app.py
+        try:
+            # Create the input for the `ask_question` function
+            question_data = {'question': incoming_msg}
 
-        # Send the response to the user via WhatsApp
+            # Invoke the function and get the answer (using Flask test request context)
+            with whatsapp_app.test_request_context('/ask-question', json=question_data):
+                answer_response = ask_question()
+
+            # Parse the answer from the Flask response object
+            answer_data = answer_response.json
+            answer = answer_data.get("answer", "Sorry, I couldn't find an answer to your question.")
+        except Exception as e:
+            logger.error(f"Error generating answer for message: {incoming_msg}. Error: {e}")
+            answer = "Sorry, an error occurred while processing your request."
+
+        # Send the answer back via WhatsApp
         resp = MessagingResponse()
         resp.message(answer)
         return str(resp)
 
     except Exception as e:
-        logger.error(f"Error processing message: {incoming_msg}. Error: {e}")
+        logger.error(f"Error processing WhatsApp message. Error: {e}")
         abort(500, "An error occurred while processing your message.")
 
-
 if __name__ == '__main__':
-    # Start the Flask app for WhatsApp on port 5001
+    # Start the Flask app for WhatsApp on port 5001 (or another port as needed)
     whatsapp_app.run(debug=True, port=5001)
