@@ -1,9 +1,11 @@
+# app.py
+
 import os
 import pickle
-import hashlib
 import faiss
 import logging
 from flask import Flask, render_template, request, jsonify, redirect, url_for
+from werkzeug.utils import secure_filename
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
@@ -24,6 +26,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# Configure maximum upload size (e.g., 16 MB)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 Megabytes
+
+# Define allowed file extensions
+ALLOWED_EXTENSIONS = {'pdf'}
+
+def allowed_file(filename):
+    """Check if the file has an allowed extension."""
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # Load the GROQ and Google API keys
 groq_api_key = os.getenv('GROQ_API_KEY')
@@ -50,238 +63,313 @@ prompt = ChatPromptTemplate.from_template(
     """
 )
 
-# Load previously uploaded files
-uploaded_files_history = []
-if os.path.exists("shared_storage/uploaded_files_history.pkl"):
-    with open("shared_storage/uploaded_files_history.pkl", "rb") as f:
-        uploaded_files_history = pickle.load(f)
+# Paths for storage
+PDF_FOLDER = "shared_storage/pdfs"
+VECTOR_FOLDER = "shared_storage/vectors"
+VECTORS_FILE = os.path.join(VECTOR_FOLDER, "vectors.index")
+DOCUMENTS_FILE = os.path.join(VECTOR_FOLDER, "documents.pkl")
 
-# Function to perform vector embedding with batching
-def embed_pdfs(docs):
+# Ensure necessary directories exist
+os.makedirs(PDF_FOLDER, exist_ok=True)
+os.makedirs(VECTOR_FOLDER, exist_ok=True)
+os.makedirs("shared_storage", exist_ok=True)
+
+# Define the embedding dimension manually
+EMBEDDING_DIMENSION = 768  # As per your model's specification
+
+# Initialize or load existing FAISS index and documents
+if os.path.exists(VECTORS_FILE) and os.path.exists(DOCUMENTS_FILE):
+    try:
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        # Load existing FAISS index
+        index = faiss.read_index(VECTORS_FILE)
+        # Load existing documents
+        with open(DOCUMENTS_FILE, "rb") as f:
+            documents = pickle.load(f)
+        # Initialize FAISS vector store
+        docstore = InMemoryDocstore({i: doc for i, doc in enumerate(documents)})
+        index_to_docstore_id = {i: i for i in range(len(documents))}
+        vectors = FAISS(
+            embedding_function=embeddings,
+            index=index,
+            docstore=docstore,
+            index_to_docstore_id=index_to_docstore_id
+        )
+        logger.info("Loaded existing FAISS index and documents.")
+    except Exception as e:
+        logger.error(f"Error loading FAISS index and documents: {e}", exc_info=True)
+        # Initialize a new FAISS index with empty data
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+        index = faiss.IndexFlatL2(EMBEDDING_DIMENSION)
+        docstore = InMemoryDocstore({})
+        vectors = FAISS(
+            embedding_function=embeddings,
+            index=index,
+            docstore=docstore,
+            index_to_docstore_id={}
+        )
+        documents = []
+        logger.info("Initialized new FAISS index and documents due to loading error.")
+else:
+    # Initialize a new FAISS index with empty data
     embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    final_documents = []
+    index = faiss.IndexFlatL2(EMBEDDING_DIMENSION)
+    docstore = InMemoryDocstore({})
+    vectors = FAISS(
+        embedding_function=embeddings,
+        index=index,
+        docstore=docstore,
+        index_to_docstore_id={}
+    )
+    documents = []
+    logger.info("Initialized new FAISS index and documents.")
 
-    for doc in docs:
-        try:
-            chunks = text_splitter.split_documents([doc])
-            final_documents.extend(chunks)
-        except Exception as e:
-            logger.error(f"Error splitting document: {doc.metadata['source']}. Error: {e}")
-            continue
-
-    vectors = None
-    batch_size = 100  # API batch size limit
-    for i in range(0, len(final_documents), batch_size):
-        batch_documents = final_documents[i:i+batch_size]
-        try:
-            batch_vectors = FAISS.from_documents(batch_documents, embeddings)
-            if vectors is None:
-                vectors = batch_vectors
-            else:
-                vectors.index.add(batch_vectors.index.reconstruct_n(0, len(batch_documents)))
-        except Exception as e:
-            logger.error(f"Error embedding batch {i//batch_size + 1}: {e}")
-            continue
-
-    return vectors, final_documents
-
-# Function to delete a PDF
-def delete_pdf(file_name):
-    global uploaded_files_history
-
+# Function to save FAISS index and documents
+def save_vector_store():
+    """Save the FAISS index and documents to disk."""
     try:
-        uploaded_files_history = [file for file in uploaded_files_history if file != file_name]
-        with open("shared_storage/uploaded_files_history.pkl", "wb") as f:
-            pickle.dump(uploaded_files_history, f)
-
-        with open("shared_storage/documents.pkl", "rb") as f:
-            documents = pickle.load(f)
-
-        documents = [doc for doc in documents if doc.metadata["source"] != file_name]
-        with open("shared_storage/documents.pkl", "wb") as f:
+        faiss.write_index(vectors.index, VECTORS_FILE)
+        with open(DOCUMENTS_FILE, "wb") as f:
             pickle.dump(documents, f)
-
-        vectors, _ = embed_pdfs(documents)
-        faiss.write_index(vectors.index, "shared_storage/vectors.index")
+        logger.info("Saved FAISS index and documents.")
     except Exception as e:
-        logger.error(f"Error deleting PDF: {file_name}. Error: {e}")
+        logger.error(f"Error saving FAISS index and documents: {e}", exc_info=True)
 
-# Function to rename a PDF
-def rename_pdf(old_name, new_name):
-    global uploaded_files_history
-
+# Function to process and embed a PDF
+def process_pdf(file_path):
+    """Extract text from a PDF, split it, embed, and add to the vector store."""
     try:
-        uploaded_files_history = [new_name if file == old_name else file for file in uploaded_files_history]
-        with open("shared_storage/uploaded_files_history.pkl", "wb") as f:
-            pickle.dump(uploaded_files_history, f)
-
-        with open("shared_storage/documents.pkl", "rb") as f:
-            documents = pickle.load(f)
-
-        for doc in documents:
-            if doc.metadata["source"] == old_name:
-                doc.metadata["source"] = new_name
-
-        with open("shared_storage/documents.pkl", "wb") as f:
-            pickle.dump(documents, f)
-
-        vectors, _ = embed_pdfs(documents)
-        faiss.write_index(vectors.index, "shared_storage/vectors.index")
-    except Exception as e:
-        logger.error(f"Error renaming PDF from {old_name} to {new_name}. Error: {e}")
-
-# Function to update a PDF
-def update_pdf(old_name, new_file):
-    global uploaded_files_history
-
-    try:
-        uploaded_files_history = [new_file.filename if file == old_name else file for file in uploaded_files_history]
-        with open("shared_storage/uploaded_files_history.pkl", "wb") as f:
-            pickle.dump(uploaded_files_history, f)
-
-        with open("shared_storage/documents.pkl", "rb") as f:
-            documents = pickle.load(f)
-
-        documents = [doc for doc in documents if doc.metadata["source"] != old_name]
-        pdf_reader = PdfReader(new_file)
+        pdf_reader = PdfReader(file_path)
         text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-
-        new_doc = Document(page_content=text, metadata={"source": new_file.filename})
-        documents.append(new_doc)
-
-        with open("shared_storage/documents.pkl", "wb") as f:
-            pickle.dump(documents, f)
-
-        vectors, _ = embed_pdfs(documents)
-        faiss.write_index(vectors.index, "shared_storage/vectors.index")
+        for page_num, page in enumerate(pdf_reader.pages, start=1):
+            try:
+                extracted_text = page.extract_text()
+                if extracted_text:
+                    text += extracted_text + "\n"
+                else:
+                    logger.warning(f"No text found on page {page_num} of {file_path}")
+            except Exception as page_e:
+                logger.error(f"Error extracting text from page {page_num} of {file_path}: {page_e}")
+        
+        if not text.strip():
+            logger.warning(f"No text extracted from PDF: {file_path}")
+            return
+        
+        doc = Document(page_content=text, metadata={"source": file_path})
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = text_splitter.split_documents([doc])
+        vectors.add_documents(chunks)
+        documents.extend(chunks)
+        save_vector_store()
+        logger.info(f"Processed and embedded PDF: {file_path}")
     except Exception as e:
-        logger.error(f"Error updating PDF: {old_name}. Error: {e}")
+        logger.error(f"Error processing PDF {file_path}: {e}", exc_info=True)
+
+# Function to remove a PDF from the vector store
+def remove_pdf_from_vector_store(file_path):
+    """Remove all documents associated with a PDF from the vector store."""
+    try:
+        global documents, vectors
+        # Identify documents to remove
+        documents_to_remove = [doc for doc in documents if doc.metadata.get('source') == file_path]
+        if not documents_to_remove:
+            logger.warning(f"No documents found for PDF: {file_path}")
+            return
+        
+        # Remove documents
+        documents = [doc for doc in documents if doc.metadata.get('source') != file_path]
+        
+        # Recreate the FAISS vector store
+        vectors = FAISS.from_documents(documents, embeddings)
+        save_vector_store()
+        logger.info(f"Removed PDF from vector store: {file_path}")
+    except Exception as e:
+        logger.error(f"Error removing PDF from vector store {file_path}: {e}", exc_info=True)
+
 
 # Route for the home page
 @app.route('/')
 def index():
     return render_template('index.html')
 
-# Route for managing PDFs
-@app.route('/manage-pdfs', methods=['GET', 'POST'])
+# Route to get metadata (e.g., version info)
+@app.route('/meta.json')
+def meta():
+    metadata = {
+        "version": "1.0.0",
+        "description": "University Study Chatbot"
+    }
+    return jsonify(metadata)
+
+# Route to manage PDFs (Upload and List)
+@app.route('/manage_pdfs', methods=['GET', 'POST'])
 def manage_pdfs():
+    error_message = None
+    uploaded_files_history = []
     if request.method == 'POST':
-        uploaded_files = request.files.getlist("pdf")
-        all_docs = []
-        new_files = []
-
+        uploaded_files = request.files.getlist('pdf')
+        if not uploaded_files:
+            error_message = "No files selected for upload."
+            return render_template('manage_pdfs.html', error_message=error_message, uploaded_files_history=uploaded_files_history)
+        
         for uploaded_file in uploaded_files:
-            try:
-                pdf_reader = PdfReader(uploaded_file)
-                text = ""
-                for page in pdf_reader.pages:
-                    text += page.extract_text()
-
-                doc = Document(page_content=text, metadata={"source": uploaded_file.filename})
-                all_docs.append(doc)
-                new_files.append(uploaded_file.filename)
-            except Exception as e:
-                logger.error(f"Error processing uploaded file: {uploaded_file.filename}. Error: {e}")
+            if uploaded_file and allowed_file(uploaded_file.filename):
+                filename = secure_filename(uploaded_file.filename)
+                file_path = os.path.join(PDF_FOLDER, filename)
+                if os.path.exists(file_path):
+                    error_message = f"File already exists: {filename}"
+                    continue
+                uploaded_file.save(file_path)
+                process_pdf(file_path)
+            else:
+                error_message = f"Invalid file type: {uploaded_file.filename}"
                 continue
-
-        vectors, final_documents = embed_pdfs(all_docs)
-
-        if not os.path.exists("shared_storage"):
-            os.makedirs("shared_storage")
-
-        faiss.write_index(vectors.index, "shared_storage/vectors.index")
-        with open("shared_storage/documents.pkl", "wb") as f:
-            pickle.dump(final_documents, f)
-
-        uploaded_files_history.extend(new_files)
-        with open("shared_storage/uploaded_files_history.pkl", "wb") as f:
-            pickle.dump(uploaded_files_history, f)
-
         return redirect(url_for('manage_pdfs'))
     
-    search_query = request.args.get('search_query', '')
-    filtered_files = [file for file in uploaded_files_history if search_query.lower() in file.lower()]
+    # For GET requests, list all uploaded PDFs
+    try:
+        uploaded_files = os.listdir(PDF_FOLDER)
+        uploaded_files = [f for f in uploaded_files if allowed_file(f)]
+        for file_name in uploaded_files:
+            uploaded_files_history.append({
+                'file_name': file_name
+            })
+    except Exception as e:
+        logger.error(f"Error listing uploaded PDFs: {e}", exc_info=True)
+        error_message = "Error retrieving uploaded PDFs."
+    
+    return render_template('manage_pdfs.html', error_message=error_message, uploaded_files_history=uploaded_files_history)
 
-    return render_template('manage_pdfs.html', uploaded_files_history=filtered_files)
-
-# Route for deleting, renaming, or updating PDFs
-@app.route('/pdf-action', methods=['POST'])
+# Route to handle PDF actions: rename, update, delete
+@app.route('/pdf_action', methods=['POST'])
 def pdf_action():
-    action = request.form['action']
-    file_name = request.form['file_name']
+    action = request.form.get('action')
+    file_name = request.form.get('file_name')
+    new_name = request.form.get('new_name')
+    
+    logger.info(f"Received action: {action} for file: {file_name}")
 
-    if action == 'delete':
-        delete_pdf(file_name)
-    elif action == 'rename':
-        new_name = request.form['new_name']
-        if new_name:
-            rename_pdf(file_name, new_name)
+    if not file_name:
+        logger.error("PDF action failed: File name is missing.")
+        return jsonify({"error": "File name is missing."}), 400
+    
+    file_path = os.path.join(PDF_FOLDER, file_name)
+    
+    if not os.path.exists(file_path):
+        logger.error(f"PDF action failed: File not found - {file_path}")
+        return jsonify({"error": "File not found."}), 404
+    
+    if action == 'rename':
+        if not new_name:
+            logger.error("Rename action failed: New name is missing.")
+            return jsonify({"error": "New name is missing."}), 400
+        # Ensure the new filename is secure and ends with .pdf
+        new_filename = secure_filename(new_name) + '.pdf'
+        new_file_path = os.path.join(PDF_FOLDER, new_filename)
+        if os.path.exists(new_file_path):
+            logger.error(f"Rename action failed: A file with the new name already exists - {new_filename}")
+            return jsonify({"error": "A file with the new name already exists."}), 400
+        try:
+            os.rename(file_path, new_file_path)
+            # Update vector store
+            remove_pdf_from_vector_store(file_path)
+            process_pdf(new_file_path)
+            logger.info(f"Renamed PDF from {file_name} to {new_filename}")
+            return jsonify({"message": "File renamed successfully."}), 200
+        except Exception as e:
+            logger.error(f"Rename action failed for {file_name}: {e}", exc_info=True)
+            return jsonify({"error": "Failed to rename the file."}), 500
+    
     elif action == 'update':
+        if 'new_file' not in request.files:
+            logger.error("Update action failed: No file part in the request.")
+            return jsonify({"error": "No file part."}), 400
         new_file = request.files['new_file']
-        if new_file:
-            update_pdf(file_name, new_file)
+        if new_file.filename == '':
+            logger.error("Update action failed: No file selected for upload.")
+            return jsonify({"error": "No selected file."}), 400
+        if new_file and allowed_file(new_file.filename):
+            # Replace the existing file
+            new_filename = secure_filename(new_file.filename)
+            new_file_path = os.path.join(PDF_FOLDER, new_filename)
+            if new_filename != file_name and os.path.exists(new_file_path):
+                logger.error(f"Update action failed: A file with the new name already exists - {new_filename}")
+                return jsonify({"error": "A file with the new name already exists."}), 400
+            try:
+                new_file.save(new_file_path)
+                # Remove old PDF from vector store
+                remove_pdf_from_vector_store(file_path)
+                # If filename changed, remove old file
+                if new_filename != file_name:
+                    os.remove(file_path)
+                # Process the new PDF
+                process_pdf(new_file_path)
+                logger.info(f"Updated PDF: {file_name} with new file: {new_filename}")
+                return jsonify({"message": "File updated successfully."}), 200
+            except Exception as e:
+                logger.error(f"Update action failed for {file_name}: {e}", exc_info=True)
+                return jsonify({"error": "Failed to update the file."}), 500
+        else:
+            logger.error("Update action failed: Invalid file type.")
+            return jsonify({"error": "Invalid file type."}), 400
+    
+    elif action == 'delete':
+        try:
+            os.remove(file_path)
+            remove_pdf_from_vector_store(file_path)
+            logger.info(f"Deleted PDF: {file_name}")
+            return jsonify({"message": "File deleted successfully."}), 200
+        except Exception as e:
+            logger.error(f"Delete action failed for {file_name}: {e}", exc_info=True)
+            return jsonify({"error": "Error deleting file."}), 500
+    else:
+        logger.error(f"Invalid action received: {action}")
+        return jsonify({"error": "Invalid action."}), 400
 
-    # After any action, ensure all PDFs are embedded in the knowledge base
-    try:
-        all_docs = []
-        for file_name in uploaded_files_history:
-            with open(os.path.join("path/to/uploaded/files", file_name), "rb") as f:
-                pdf_reader = PdfReader(f)
-                text = ""
-                for page in pdf_reader.pages:
-                    text += page.extract_text()
-                doc = Document(page_content=text, metadata={"source": file_name})
-                all_docs.append(doc)
-
-        vectors, final_documents = embed_pdfs(all_docs)
-        faiss.write_index(vectors.index, "shared_storage/vectors.index")
-        with open("shared_storage/documents.pkl", "wb") as f:
-            pickle.dump(final_documents, f)
-    except Exception as e:
-        logger.error(f"Error re-embedding all documents after action. Error: {e}")
-
-    return redirect(url_for('manage_pdfs'))
-
-# Route for asking questions (AJAX route for chatbot interaction)
-@app.route('/ask-question', methods=['POST'])
+# Route for the Ask Question page
+@app.route('/ask_question', methods=['GET', 'POST'])
 def ask_question():
-    question = request.json.get('question', '')
-
-    if not question:
-        return jsonify({"error": "No question provided."}), 400
-
-    try:
-        # Retrieve FAISS index and documents
-        index = faiss.read_index("shared_storage/vectors.index")
-        with open("shared_storage/documents.pkl", "rb") as f:
-            documents = pickle.load(f)
-
-        # Create an in-memory docstore
-        docstore = InMemoryDocstore({i: doc for i, doc in enumerate(documents)})
-        vectors = FAISS(embedding_function=GoogleGenerativeAIEmbeddings(model="models/embedding-001"), 
-                        docstore=docstore, 
-                        index=index, 
-                        index_to_docstore_id={i: i for i in range(len(documents))})
-
-        # Prepare and retrieve context for the question
-        document_chain = create_stuff_documents_chain(llm, prompt)
-        retriever = vectors.as_retriever()
-        retrieval_chain = create_retrieval_chain(retriever, document_chain)
-
-        # Get the answer
-        response = retrieval_chain.invoke({'input': question})
-        answer = response['answer']
-
-        # Provide detailed logging for debugging
-        logger.info(f"Question: {question}, Answer: {answer}")
+    if request.method == 'POST':
+        # Handle form data
+        question = request.form.get('question')
         
-        return jsonify({"answer": answer})
-    except Exception as e:
-        logger.error(f"Error processing question: {question}. Error: {e}")
-        return jsonify({"error": "An error occurred while processing your question."}), 500
+        if not question:
+            logger.error("Ask Question action failed: Question is missing.")
+            return jsonify({"error": "Question is missing."}), 400
+        
+        try:
+            if not documents:
+                logger.error("Ask Question action failed: No documents available.")
+                return jsonify({"error": "No documents available for answering questions."}), 400
+            
+            # Create an in-memory docstore
+            docstore = InMemoryDocstore({i: doc for i, doc in enumerate(documents)})
+            vectors_local = FAISS(
+                embedding_function=embeddings,
+                index=vectors.index,
+                docstore=docstore,
+                index_to_docstore_id={i: i for i in range(len(documents))}
+            )
+
+            # Prepare and retrieve context for the question
+            document_chain = create_stuff_documents_chain(llm, prompt)
+            retriever = vectors_local.as_retriever()
+            retrieval_chain = create_retrieval_chain(retriever, document_chain)
+
+            # Get the answer
+            response = retrieval_chain.invoke({'input': question})
+            answer = response['answer']
+
+            # Provide detailed logging for debugging
+            logger.info(f"Question: {question}, Answer: {answer}")
+
+            return jsonify({"answer": answer, "progress": 1.0})  # Assuming progress is complete
+        except Exception as e:
+            logger.error(f"Error processing question: {question}. Error: {e}", exc_info=True)
+            return jsonify({"error": "An error occurred while processing your question."}), 500
+    
+    # For GET requests, render the page
+    return render_template('ask_question.html')
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True)
