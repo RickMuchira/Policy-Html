@@ -19,7 +19,13 @@ document.addEventListener("DOMContentLoaded", () => {
             ? `<p></p>`
             : `<span class="material-symbols-outlined">smart_toy</span><p></p>`;
         chatLi.innerHTML = chatContent;
-        chatLi.querySelector("p").textContent = message;
+        
+        // Process only bold markdown while preserving original style
+        const messageElement = chatLi.querySelector("p");
+        // Only convert bold (**text**) to <strong> tags
+        const formattedMessage = message.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+        messageElement.innerHTML = formattedMessage;
+        
         return chatLi;
     };
 
@@ -46,7 +52,9 @@ document.addEventListener("DOMContentLoaded", () => {
             const result = await response.json();
 
             if (result.answer) {
-                messageElement.textContent = result.answer;
+                // Only convert bold (**text**) to <strong> tags
+                const formattedMessage = result.answer.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+                messageElement.innerHTML = formattedMessage;
             } else if (result.error) {
                 messageElement.textContent = `Error: ${result.error}`;
             } else {

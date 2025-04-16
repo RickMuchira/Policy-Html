@@ -4,6 +4,7 @@ import os
 import pickle
 import faiss
 import logging
+import re
 from flask import Flask, render_template, request, jsonify, redirect, url_for
 from werkzeug.utils import secure_filename
 from PyPDF2 import PdfReader
@@ -48,18 +49,38 @@ if not groq_api_key or not google_api_key:
 
 os.environ["GOOGLE_API_KEY"] = google_api_key
 
-# Initialize ChatGroq
-llm = ChatGroq(groq_api_key=groq_api_key, model_name="Llama3-8b-8192")
+# Initialize ChatGroq with reduced temperature for more accurate policy responses
+llm = ChatGroq(groq_api_key=groq_api_key, model_name="Llama3-8b-8192", temperature=0.2)
 
-# Create ChatPromptTemplate
+# Create prompt template with bold headers instead of Markdown headings
 prompt = ChatPromptTemplate.from_template(
     """
-    Answer the questions based on the provided context only.
-    Please provide the most accurate response based on the question
+    You are a highly knowledgeable HR policy expert at a university. Your job is to provide clear, accurate, and comprehensive answers about university policies based on the information in the provided context. 
+
+    <guidelines>
+    - Focus exclusively on information contained in the context below.
+    - Structure your answers with bold text for main sections and subsections using **Section Title** format.
+    - Use bullet points for listing requirements, eligibility criteria, procedures, or steps.
+    - Include relevant details from the context about the policy in question.
+    - When explaining procedures, present them in chronological order or by importance.
+    - Include specific policy numbers, form names, or document references if they appear in the context.
+    - Quote exact eligibility criteria, time periods, and deadlines from the context.
+    - If the policy mentions exceptions or special cases, include these.
+    - For any policy that requires approvals, state who must approve and what the process entails.
+    - If multiple sections of the context mention the same policy, synthesize the information.
+    - If citing information, note the page number if available (e.g., "According to Page 4 of the policy...").
+    - If you cannot find sufficient information about the specific policy asked, simply provide information about related policies that are mentioned in the context without stating limitations or what is missing.
+    - Do not include a "Limitations" section or any statements about information not being available.
+    - Never suggest contacting HR or other departments for more information.
+    </guidelines>
+
     <context>
     {context}
-    <context>
-    Questions: {input}
+    </context>
+
+    Question: {input}
+
+    Begin your response with a clear definition or overview of the policy in bold (e.g., **Policy Overview**). Then provide a comprehensive explanation of aspects of the policy mentioned in the context, using bold text for headings and subheadings (e.g., **Eligibility Criteria**, **Application Process**, etc.) and formatting for readability. Keep your response focused on providing helpful information that IS available in the context and avoid mentioning what is NOT available.
     """
 )
 
@@ -124,6 +145,41 @@ else:
     documents = []
     logger.info("Initialized new FAISS index and documents.")
 
+# Function to extract policy number from text if available
+def extract_policy_number(text):
+    """Extract policy number from text using regex pattern matching."""
+    # Common patterns for policy numbers: Policy X.X, Policy X.X.X, etc.
+    patterns = [
+        r'Policy\s+(\d+\.\d+(?:\.\d+)?)',  # Policy X.X or Policy X.X.X
+        r'Policy\s+No\.\s*(\d+\.\d+(?:\.\d+)?)',  # Policy No. X.X
+        r'Policy\s+Number\s*(\d+\.\d+(?:\.\d+)?)',  # Policy Number X.X
+        r'University\s+Policy\s*(\d+\.\d+(?:\.\d+)?)'  # University Policy X.X
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            return matches[0]
+    
+    return None
+
+# Detect section headers and add them to metadata
+def extract_section_headers(text):
+    """Extract policy section headers for better context."""
+    # Look for common section header patterns
+    section_pattern = r'^(?:\d+\.)?\s*([A-Z][A-Za-z\s]{2,50})(?:\:|\.\s|$)'
+    headers = []
+    
+    for line in text.split('\n'):
+        line = line.strip()
+        match = re.match(section_pattern, line)
+        if match and len(line) < 100:  # Avoid matching paragraphs
+            header = match.group(1).strip()
+            if header and not any(word in header.lower() for word in ['page', 'university', 'policy']):
+                headers.append(header)
+    
+    return headers
+
 # Function to save FAISS index and documents
 def save_vector_store():
     """Save the FAISS index and documents to disk."""
@@ -135,17 +191,39 @@ def save_vector_store():
     except Exception as e:
         logger.error(f"Error saving FAISS index and documents: {e}", exc_info=True)
 
-# Function to process and embed a PDF
+# Improved PDF processing function with better text extraction and metadata
 def process_pdf(file_path):
     """Extract text from a PDF, split it, embed, and add to the vector store."""
     try:
         pdf_reader = PdfReader(file_path)
+        total_pages = len(pdf_reader.pages)
+        filename = os.path.basename(file_path)
+        policy_number = None
+        full_text = ""
+        
+        # First pass: Extract full text and look for policy number
+        for page_num, page in enumerate(pdf_reader.pages, start=1):
+            try:
+                extracted_text = page.extract_text()
+                if extracted_text:
+                    full_text += extracted_text + " "
+                    # Try to find policy number on first few pages
+                    if page_num <= 3 and not policy_number:
+                        policy_number = extract_policy_number(extracted_text)
+            except Exception as e:
+                logger.error(f"First-pass error extracting text from page {page_num}: {e}")
+        
+        # Extract any section headers from the full document
+        section_headers = extract_section_headers(full_text)
+        
+        # Second pass: Process each page with clear page markers
         text = ""
         for page_num, page in enumerate(pdf_reader.pages, start=1):
             try:
                 extracted_text = page.extract_text()
                 if extracted_text:
-                    text += extracted_text + "\n"
+                    # Format: [PAGE X OF Y] for easy citation in responses
+                    text += f"[PAGE {page_num} OF {total_pages}]\n{extracted_text}\n\n"
                 else:
                     logger.warning(f"No text found on page {page_num} of {file_path}")
             except Exception as page_e:
@@ -155,13 +233,45 @@ def process_pdf(file_path):
             logger.warning(f"No text extracted from PDF: {file_path}")
             return
         
-        doc = Document(page_content=text, metadata={"source": file_path})
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        # Add detailed metadata for HR policy document
+        doc = Document(
+            page_content=text, 
+            metadata={
+                "source": file_path,
+                "filename": filename,
+                "total_pages": total_pages,
+                "type": "policy_document",
+                "policy_number": policy_number,
+                "section_headers": section_headers if section_headers else None
+            }
+        )
+        
+        # Optimize chunking for policy documents
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=700,  # Smaller chunks for more precise retrieval
+            chunk_overlap=250,  # Higher overlap to maintain policy context
+            separators=["\n\n", "\n", ". ", " ", ""]  # Custom separators for policy documents
+        )
+        
         chunks = text_splitter.split_documents([doc])
+        
+        # Add detailed metadata to each chunk
+        for i, chunk in enumerate(chunks):
+            chunk.metadata["chunk_id"] = i
+            chunk.metadata["chunk_count"] = len(chunks)
+            # Look for page markers in the chunk text to set page numbers
+            page_markers = re.findall(r'\[PAGE (\d+) OF \d+\]', chunk.page_content)
+            if page_markers:
+                chunk.metadata["page_numbers"] = page_markers
+            
         vectors.add_documents(chunks)
         documents.extend(chunks)
         save_vector_store()
-        logger.info(f"Processed and embedded PDF: {file_path}")
+        logger.info(f"Processed and embedded PDF: {file_path} - Created {len(chunks)} chunks")
+        if policy_number:
+            logger.info(f"Identified Policy Number: {policy_number}")
+        if section_headers:
+            logger.info(f"Identified Section Headers: {', '.join(section_headers[:5])}...")
     except Exception as e:
         logger.error(f"Error processing PDF {file_path}: {e}", exc_info=True)
 
@@ -197,7 +307,7 @@ def index():
 def meta():
     metadata = {
         "version": "1.0.0",
-        "description": "University Study Chatbot"
+        "description": "University HR Policy Chatbot"
     }
     return jsonify(metadata)
 
@@ -351,9 +461,18 @@ def ask_question():
                 index_to_docstore_id={i: i for i in range(len(documents))}
             )
 
+            # Enhanced retriever optimized for policy questions - using similarity instead of MMR
+            # for better focus on the most relevant chunks
+            retriever = vectors_local.as_retriever(
+                search_type="similarity",  # Use similarity for most relevant results
+                search_kwargs={
+                    "k": 12,  # Retrieve more chunks to find any related information
+                    "fetch_k": 30  # Consider even more candidates before selecting the final k
+                }
+            )
+
             # Prepare and retrieve context for the question
             document_chain = create_stuff_documents_chain(llm, prompt)
-            retriever = vectors_local.as_retriever()
             retrieval_chain = create_retrieval_chain(retriever, document_chain)
 
             # Get the answer
@@ -361,7 +480,9 @@ def ask_question():
             answer = response['answer']
 
             # Provide detailed logging for debugging
-            logger.info(f"Question: {question}, Answer: {answer}")
+            logger.info(f"Question: {question}, Answer generated successfully")
+            # Avoid logging full answer text to keep logs manageable
+            logger.debug(f"Answer first 100 chars: {answer[:100]}...")
 
             return jsonify({"answer": answer, "progress": 1.0})  # Assuming progress is complete
         except Exception as e:
